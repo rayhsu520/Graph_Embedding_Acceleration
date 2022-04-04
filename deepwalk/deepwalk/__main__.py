@@ -1,6 +1,8 @@
 #! /usr/bin/env python
 # -*- coding: utf-8 -*-
 
+import time, json
+
 import os
 import sys
 import random
@@ -10,10 +12,10 @@ from collections import Counter
 from concurrent.futures import ProcessPoolExecutor
 import logging
 
-from . import graph
-from . import walks as serialized_walks
+from deepwalk import graph
+from deepwalk import walks as serialized_walks
 from gensim.models import Word2Vec
-from .skipgram import Skipgram
+from skipgram import Skipgram
 
 from six import text_type as unicode
 from six import iteritems
@@ -21,6 +23,9 @@ from six.moves import range
 
 import psutil
 from multiprocessing import cpu_count
+
+import community, json
+import networkx as nx
 
 p = psutil.Process(os.getpid())
 try:
@@ -45,9 +50,107 @@ def debug(type_, value, tb):
     print(u"\n")
     pdb.pm()
 
+def nxGraph(fn):
+  fh = open(fn, 'rb')
+  nxG = nx.read_edgelist(fh, create_using=nx.Graph(), nodetype=int)
+  fh.close()
+  fh = open(fn, 'rb')
+  smallG = nx.read_edgelist(fh, create_using=nx.Graph(), nodetype=int)
+  fh.close()
+  
+  # print smallG.nodes()
+  remove = [node for node in nxG.nodes() if node < 30000]
+  # print remove, len(remove)
+  smallG.remove_nodes_from(remove)
+  # print smallG.nodes()
+  
+  # add this node manually cause this is missing
+  
+  # nxG.add_node(88041971)
+
+  print "nxG: # of nodes: {}".format(nx.number_of_nodes(nxG))
+  print "     # of edges: {}".format(nx.number_of_edges(nxG))
+  print "     is_directed: {}".format(nx.is_directed(nxG))
+  print "smG: # of nodes: {}".format(nx.number_of_nodes(smallG))
+  print "     # of edges: {}".format(nx.number_of_edges(smallG))
+  print "     is_directed: {}".format(nx.is_directed(smallG))
+
+  return nx.closeness_centrality(smallG)
+
+def InitAliasTableBC():
+  sumBC = 0
+  cur_small_block = 0
+  cur_large_block = 0
+  norm_prob = []
+  small_block = []
+  large_block = []
+  length = len(graph.Graph.nodeBCList)
+  for k in range(length):
+    graph.Graph.prob.append(-1)
+    graph.Graph.alias.append(-1)
+  for k in graph.Graph.nodeBCList:
+    sumBC += graph.Graph.nodeBC[k]
+  #print sumBC
+  for k in graph.Graph.nodeBCList:
+    norm_prob.append( graph.Graph.nodeBC[k]*length/sumBC )
+  for k in range(length-1,-1,-1):
+    if norm_prob[k] == 0:
+      continue
+    if norm_prob[k] < 1:
+      small_block.append(k)
+    else:
+      large_block.append(k)
+  num_small_block = len(small_block)
+  num_large_block = len(large_block)
+  while (num_small_block!=0 and num_large_block!=0):
+    num_small_block -= 1
+    num_large_block -= 1
+    cur_small_block = small_block[num_small_block]
+    cur_large_block = large_block[num_large_block]
+    graph.Graph.prob[cur_small_block] = norm_prob[cur_small_block]
+    graph.Graph.alias[cur_small_block] = cur_large_block
+    norm_prob[cur_large_block] = norm_prob[cur_large_block]+norm_prob[cur_small_block]-1
+    if norm_prob[cur_large_block] < 1:
+      small_block[num_small_block] = cur_large_block
+      num_small_block += 1
+    else:
+      large_block[num_large_block] = cur_large_block
+      num_large_block += 1
+    #print graph.Graph.prob, graph.Graph.alias
+  while num_large_block!=0:
+    num_large_block -= 1
+    graph.Graph.prob[large_block[num_large_block]] = 1
+  while num_small_block!=0:
+    num_small_block -= 1
+    graph.Graph.prob[small_block[num_small_block]] = 1
+
+def calculateBC(fn):
+  for line in fn:
+    node, value = line.strip().split()[0:]
+    node = int(node)
+    value = float(value)
+    if graph.Graph.nodeList[graph.Graph.nodePos[node]].layer == 1:
+      graph.Graph.nodeBC.setdefault(node,value)
+      graph.Graph.nodeBCList.append(node)
+  InitAliasTableBC()
+  #for k in range(len(graph.Graph.prob)):
+  #  print graph.Graph.alias[k],graph.Graph.prob[k]
 
 def process(args):
 
+  # Build "(Node, Layer)" map
+  if args.floor != "":
+    floorFile = open(args.floor, 'r')
+    for line in floorFile:
+      nd, layer = line.strip().split()[:2]
+      nd = int(nd)
+      layer = int(layer)
+      #print nd, layer
+      if nd not in graph.Graph.nodePos:
+        graph.Graph.nodeList.append(graph.NodeType(nd,layer))
+        graph.Graph.nodePos[nd] = len(graph.Graph.nodeList)-1
+
+  # read input Graph
   if args.format == "adjlist":
     G = graph.load_adjacencylist(args.input, undirected=args.undirected)
   elif args.format == "edgelist":
@@ -56,23 +159,60 @@ def process(args):
     G = graph.load_matfile(args.input, variable_name=args.matfile_variable_name, undirected=args.undirected)
   else:
     raise Exception("Unknown file format: '%s'.  Valid formats: 'adjlist', 'edgelist', 'mat'" % args.format)
+  
+  timelog = ""
 
   print("Number of nodes: {}".format(len(G.nodes())))
-
   num_walks = len(G.nodes()) * args.number_walks
-
   print("Number of walks: {}".format(num_walks))
-
   data_size = num_walks * args.walk_length
-
   print("Data size (walks*length): {}".format(data_size))
+
+  # Centrality calculation >> store in File
+  '''
+  centrality = nxGraph(args.input)
+  print centrality
+  fo = open("closeness.txt","wb")
+  for k in centrality.keys():
+    fo.write("{} {}\n".format(k,centrality[k]))
+  fo.close()
+  '''
+  #exit()
+  lsfile = open(args.LSfile, 'r')
+  calculateBC(lsfile)
+  #exit()
+
+  #building (Unit)Metapath Table
+  MPList = []
+  graph.Graph.mpath = []
+  if args.metapath != "":
+    mpfile = open(args.metapath, 'r')
+    for line in mpfile:
+      MPList.append(int(line.strip().split()[0]))
+  print "(Unit)Metapath: {}".format(MPList)
+  while len(graph.Graph.mpath) < args.walk_length:
+    graph.Graph.mpath.extend(MPList)
+  args.walk_length = len(graph.Graph.mpath)
+  print "(Full)Metapath: {}\nargs.walk_length: {}".format(graph.Graph.mpath, args.walk_length)
+  
+  tStart = time.time()
 
   if data_size < args.max_memory_data_size:
     print("Walking...")
     walks = graph.build_deepwalk_corpus(G, num_paths=args.number_walks,
-                                        path_length=args.walk_length, alpha=0, rand=random.Random(args.seed))
+                                        path_length=args.walk_length, alpha=0, rand=random.Random())
+    tEnd = time.time()
+    print "Walking takes {} seconds".format(round(tEnd - tStart, 3))
+    timelog = "{}, {}".format( timelog, round(tEnd-tStart, 3) )
+    print "Number of walks generated: {}".format(len(walks))
+
+    tStart = time.time()
     print("Training...")
-    model = Word2Vec(walks, size=args.representation_size, window=args.window_size, min_count=0, sg=1, hs=1, workers=args.workers)
+    model = Word2Vec(walks, size=args.representation_size, window=args.window_size, min_count=0, workers=args.workers)
+    tEnd = time.time()
+
+    print "Training takes {} seconds".format(round(tEnd - tStart, 3))
+    timelog = "{}, {}, ,{}".format( timelog, round(tEnd-tStart, 3), len(walks) )
   else:
     print("Data size {} is larger than limit (max-memory-data-size: {}).  Dumping walks to disk.".format(data_size, args.max_memory_data_size))
     print("Walking...")
@@ -90,12 +230,15 @@ def process(args):
       vertex_counts = G.degree(nodes=G.iterkeys())
 
     print("Training...")
-    walks_corpus = serialized_walks.WalksCorpus(walk_files)
-    model = Skipgram(sentences=walks_corpus, vocabulary_counts=vertex_counts,
+    model = Skipgram(sentences=serialized_walks.combine_files_iter(walk_files), vocabulary_counts=vertex_counts,
                      size=args.representation_size,
-                     window=args.window_size, min_count=0, trim_rule=None, workers=args.workers)
+                     window=args.window_size, min_count=0, workers=args.workers)
 
-  model.wv.save_word2vec_format(args.output)
+  model.save_word2vec_format(args.output)
+  with open(args.output, 'r') as f:
+    timelog = "{}, {}\n".format( timelog, f.readline().split()[0] )
+  with open(args.timelog, 'ab') as tl:
+    tl.write(timelog)
 
 
 def main():
@@ -144,12 +287,23 @@ def main():
   parser.add_argument('--walk-length', default=40, type=int,
                       help='Length of the random walk started at each node')
 
-  parser.add_argument('--window-size', default=5, type=int,
+  parser.add_argument('--window-size', default=10, type=int,
                       help='Window size of skipgram model.')
 
   parser.add_argument('--workers', default=1, type=int,
                       help='Number of parallel processes.')
 
+  parser.add_argument('--floor', default="",
+                      help='For dataset more than one tier.')
+
+  parser.add_argument('--metapath', default="",
+                      help='User-defined metapath used for random walks.')
+
+  parser.add_argument('--timelog', default="TIMELOG.csv",
+                      help='Time output.')
+
+  parser.add_argument('--LSfile', default="",
+                      help='Landmark selection file.')
 
   args = parser.parse_args()
   numeric_level = getattr(logging, args.log.upper(), None)
